@@ -30,6 +30,11 @@ extern crate alloc;
 #[macro_use]
 extern crate std;
 
+extern crate digest;
+
+#[cfg(test)]
+extern crate sha2;
+
 #[cfg(test)]
 #[cfg(feature = "groups")]
 mod tests;

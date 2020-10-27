@@ -17,6 +17,9 @@ rustdoc-args = [ "--html-in-header", "katex-header.html" ]
 
 [dev-dependencies]
 criterion = "0.3"
+rand = "0.7.3"
+sha2 = "0.9.1"
+
 
 [[bench]]
 name = "groups"
@@ -47,6 +50,10 @@ default-features = false
 [dependencies.subtle]
 version = "2.2.1"
 default-features = false
+
+[dependencies.digest]
+version = "0.9"
+
 
 [features]
 default = ["groups", "pairings", "alloc"]

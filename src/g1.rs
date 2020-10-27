@@ -4,6 +4,7 @@ use core::borrow::Borrow;
 use core::fmt;
 use core::iter::Sum;
 use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use digest::Digest;
 use group::{
     prime::{PrimeCurve, PrimeCurveAffine, PrimeGroup},
     Curve, Group, GroupEncoding, UncompressedEncoding,
@@ -589,6 +590,141 @@ impl G1Projective {
             ]),
             z: Fp::one(),
         }
+    }
+
+    /// Implements "Indifferentiable Hashing to Barreto–Naehrig Curves" from Foque-Tibouchi.
+    /// <https://www.di.ens.fr/~fouque/pub/latincrypt12.pdf>
+    pub fn hash_from_bytes<D>(input: &[u8]) -> Self
+        where D: Digest<OutputSize = digest::generic_array::typenum::U64> + Default
+    {
+        // The construction of Foque et al. requires us to construct two
+        // "random oracles" in the field, encode their image with `sw_encode`,
+        // and finally add them.
+        // We construct them appending to the message the string
+        // $name_$oracle
+        // For instance, the first oracle in group G1 appends: "G1_0".
+        let mut digest_t0 = D::default();
+        digest_t0.update(b"t0");
+        digest_t0.update(input);
+        let t0 = Self::sw_encode(Fp::from_hash::<D>(digest_t0));
+        assert!(bool::from(t0.is_on_curve()));
+
+        let mut digest_t1 = D::default();
+        digest_t1.update(b"t1");
+        digest_t1.update(input);
+        let t1 = Self::sw_encode(Fp::from_hash::<D>(digest_t1));
+        assert!(bool::from(t1.is_on_curve()));
+
+        (t0 + t1).clear_cofactor()
+    }
+
+
+    /// Implements the Shallue–van de Woestijne encoding described in
+    /// Section 3, "Indifferentiable Hashing to Barreto–Naehrig Curves"
+    /// from Foque-Tibouchi: <https://www.di.ens.fr/~fouque/pub/latincrypt12.pdf>.
+    ///
+    /// The encoding is adapted for BLS12-381.
+    ///
+    /// This encoding produces a point in E/E'. It does not reach every
+    /// point. The resulting point may not be in the prime order subgroup,
+    /// but it will be on the curve. It could be the point at infinity.
+    ///
+    /// ## Description
+    ///
+    /// Lemma 3 gives us three points:
+    ///
+    /// x_1 = (-1 + sqrt(-3))/2 - (sqrt(-3) * t^2)/(1 + b + t^2)
+    /// x_2 = (-1 - sqrt(-3))/2 + (sqrt(-3) * t^2)/(1 + b + t^2)
+    /// x_3 = 1 - (1 + b + t^2)^2/(3 * t^2)
+    ///
+    /// Given t != 0 and t != 1 + b + t^2 != 0, at least one of
+    /// these three points (x1, x2, x3) is valid on the curve.
+    ///
+    /// In the paper, 1 + b + t^2 != 0 has no solutions, but for
+    /// E(Fq) in our construction, it does have two solutions.
+    /// We follow the convention of the paper by mapping these
+    /// to some arbitrary points; in our case, the positive/negative
+    /// fixed generator (with the parity of the y-coordinate
+    /// corresponding to the t value).
+    ///
+    /// Unlike the paper, which maps t = 0 to an arbitrary point,
+    /// we map it to the point at infinity. This arrangement allows
+    /// us to preserve sw_encode(t) = sw_encode(-t) for all t.
+    ///
+    /// We choose the smallest i such that x_i is on the curve.
+    /// We choose the corresponding y-coordinate with the same
+    /// parity, defined as the point being lexicographically larger
+    /// than its negative.
+    fn sw_encode(t: Fp) -> Self {
+
+        // SWENC_SQRT_NEG_THREE = sqrt(-3) mod q =
+        // 1586958781458431025242759403266842894121773480562120986020912974854563298150952611241517463240701
+        // used to help find a Fq-rational point in the conic described by the Shallue–van de Woestijne encoding.
+        let swenc_sqrt_neg_three = (-Fp::one() - Fp::one() - Fp::one()).sqrt();
+        // Fp::from_raw_unchecked([
+        //     0x1dec_6c36_f318_1f22,
+        //     0xb4b9_bb64_1054_b457,
+        //     0x25695a2be9415286,
+        //     0x982b6cbf66c749bc,
+        //     0x7d58e1ae1feb7873,
+        //     0x62c96300937c0b9,
+        // ]);
+        assert!(bool::from(swenc_sqrt_neg_three.is_some()));
+        let swenc_sqrt_neg_three = swenc_sqrt_neg_three.unwrap();
+
+        // SWENC_SQRT_NEG_THREE_MINUS_ONE_DIV_TWO = (sqrt(-3) - 1) / 2 mod q =
+        // 793479390729215512621379701633421447060886740281060493010456487427281649075476305620758731620350
+        // used to speed up the computation of the abscissa x_1(t).
+        let swenc_sqrt_neg_three_minus_one_div_two: Fp = (swenc_sqrt_neg_three - Fp::one()) * (Fp::one() + Fp::one()).invert().unwrap();
+        // Fp::from_raw_unchecked([
+        //     0x30f1361b798a64e8,
+        //     0xf3b8ddab7ece5a2a,
+        //     0x16a8ca3ac61577f7,
+        //     0xc26a2ff874fd029b,
+        //     0x3636b76660701c6e,
+        //     0x51ba4ab241b6160,
+        // ]);
+
+        // Handle the case t == 0
+        if bool::from(t.is_zero()) {
+            return Self::identity();
+        }
+        // We choose the corresponding y-coordinate with the same parity as t.
+        let parity = t.lexicographically_largest();
+
+        // w = (t^2 + b + 1)^(-1) * sqrt(-3) * t
+        let mut w = t.square() + B + Fp::one();
+        // Handle the case t^2 + b + 1 == 0
+        if bool::from(w.is_zero())  {
+            let mut ret = Self::identity();
+            ret.conditional_assign(&(-ret), parity);
+            return ret;
+        }
+        w = w.invert().unwrap() * swenc_sqrt_neg_three * t;
+
+        // x1 = - wt  + (sqrt(-3) - 1) / 2
+        let x1 = -w*t + swenc_sqrt_neg_three_minus_one_div_two;
+        // x2 = -1 - x1
+        let x2 = -x1 - Fp::one();
+        // x3 = 1/w^2 + 1
+        let x3 = w.square().invert().unwrap() + Fp::one();
+
+        let p1 = Self::point_from_x(x1, parity);
+        let p2 = Self::point_from_x(x2, parity);
+        let p3 = Self::point_from_x(x3, parity);
+        assert!(bool::from(p1.is_some()) || bool::from(p2.is_some()) || bool::from(p3.is_some()));
+        // XXX: Fix constant-time
+        if bool::from(p1.is_some()) { p1.unwrap() }
+        else if bool::from(p2.is_some()) { p2.unwrap() }
+        else { p3.unwrap() }
+    }
+
+    // FIX: is the point at infinity handled correctly?
+    fn point_from_x(x: Fp, parity: Choice) -> CtOption<G1Projective> {
+        (x.square() * x + B).sqrt().and_then(|mut y| {
+                    y.conditional_assign(&(-y), parity);
+                    CtOption::new(G1Projective {x, y, z: Fp::one()}, 1.into())
+        })
     }
 
     /// Computes the doubling of this point.
@@ -1542,6 +1678,49 @@ fn test_mul_by_x() {
     assert_eq!(point.mul_by_x(), point * x);
 }
 
+#[test]
+fn test_sw_encode() {
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..100 {
+        let t = Fp::random(&mut rng);
+        let p = G1Projective::sw_encode(t);
+        //assert!(!bool::from(p.is_identity()));
+        assert!(bool::from(p.is_on_curve()));
+    }
+}
+
+
+#[test]
+fn test_g1_sw_encode_degenerate() {
+    // test the degenerate case t = 0
+    let p = G1Projective::sw_encode(Fp::zero());
+    assert!(bool::from(p.is_on_curve()));
+    assert!(bool::from(p.is_identity()));
+
+    // test the degenerate case t^2 = - b - 1
+    let t = (-B -Fp::one()).sqrt().unwrap();
+    // let p = G1Projective::sw_encode(t);
+    // assert!(bool::from(p.is_on_curve()));
+    // assert!(!bool::from(p.is_identity()));
+    // assert_eq!(bool::from(p.y.lexicographically_largest()), bool::from(t.lexicographically_largest()));
+    // assert_eq!(p, G1Projective::generator());
+    // let p = G1Projective::sw_encode(-t);
+    // assert!(bool::from(p.is_on_curve()));
+    // assert!(!bool::from(p.is_identity()));
+    // assert_eq!(bool::from(p.y.lexicographically_largest()), bool::from(t.lexicographically_largest()));
+    // assert_eq!(p, -G1Projective::generator());
+
+    // test that the encoding function is odd for the above t
+    let expected_zero = G1Projective::sw_encode(t) + G1Projective::sw_encode(-t);
+    assert!(bool::from(expected_zero.is_identity()));
+}
+
+#[test]
+fn test_hash_from_bytes() {
+    let one = G1Projective::hash_from_bytes::<sha2::Sha512>(b"2L of coffee");
+    assert!(bool::from(one.is_on_curve()));
+}
 #[test]
 fn test_clear_cofactor() {
     // the generator (and the identity) are always on the curve,

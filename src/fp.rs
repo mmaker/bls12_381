@@ -7,7 +7,11 @@ use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 use rand_core::RngCore;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption};
 
+
+use digest::Digest;
+
 use crate::util::{adc, mac, sbb};
+
 
 // The internal representation of this type is six 64-bit unsigned
 // integers in little-endian order. `Fp` values are always in
@@ -74,7 +78,7 @@ const MODULUS: [u64; 6] = [
     0x1a01_11ea_397f_e69a,
 ];
 
-/// INV = -(p^{-1} mod 2^64) mod 2^64
+/// INV = -p^{-1} mod 2^64
 const INV: u64 = 0x89f3_fffc_fffc_fffd;
 
 /// R = 2^384 mod p
@@ -170,6 +174,38 @@ impl Fp {
 
     pub fn is_zero(&self) -> Choice {
         self.ct_eq(&Fp::zero())
+    }
+
+    /// Hash into the field. This takes a `Blake2b` instance,
+    /// computes the hash, and interprets the hash as a big endian
+    /// number. The number is reduced mod q. The caller is
+    /// responsible for ensuring the Blake2b instance was
+    /// initialized with a 64 byte digest result.
+    pub fn hash_from_bytes<D>(input: &[u8]) -> Fp
+        where D: Digest<OutputSize = digest::generic_array::typenum::U64> + Default
+    {
+        let mut hash = D::default();
+        hash.update(input);
+        Self::from_hash(hash)
+    }
+
+
+    pub fn from_hash<D>(hash: D) -> Self
+        where D: Digest<OutputSize=digest::generic_array::typenum::U64> + Default
+    {
+        let output = hash.finalize();
+        let bytes = output.as_slice();
+        Self::montgomery_reduce(
+            u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[0..8]).unwrap()),
+            u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[8..16]).unwrap()),
+            u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[16..24]).unwrap()),
+            u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[24..32]).unwrap()),
+            u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[32..40]).unwrap()),
+            u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[40..48]).unwrap()),
+            // is this necessary for enough randomness?
+            // u64::from_be_bytes(<[u8; 8]>::try_from(&bytes[48..64]).unwrap()),
+            0, 0, 0, 0, 0, 0
+        )
     }
 
     /// Attempts to convert a big-endian byte representation of
@@ -913,4 +949,29 @@ fn test_lexicographic_largest() {
         ])
         .lexicographically_largest()
     ));
+}
+
+
+#[test]
+fn test_hash() {
+    // let mut lsb_ones = 0i32;
+    // lsb_ones should a uniformly random variable of mean 1000*X
+    // where X is a coin flip
+    // let mean = 1000 * 48 * 8 / 2;
+    for _ in 0..1000 {
+        let element = Fp::hash_from_bytes::<sha2::Sha512>(b"test hashing over Fp");
+        assert!(!bool::from(element.is_zero()));
+    }
+        // let element = element.unwrap();
+
+    //     // count how many less-significant bits are set in each limb
+    //     lsb_ones += element.to_bytes()
+    //         .as_ref()
+    //         .iter()
+    //         .map(|x| if x % 2 == 0 { (0i32 - mean).pow(2) } else { (1i32 - mean).pow(2)})
+    //         .sum::<i32>() / (1000 * 48 * 8);
+    // }
+    // // variance should be the variance of 1000*48*Var(coin-flip)
+    // let variance = 192000 * 3;
+    // assert!((lsb_ones - variance) < variance);
 }
